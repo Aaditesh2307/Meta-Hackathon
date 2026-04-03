@@ -1,0 +1,6 @@
+spec_version: 1
+name: git_conflict_env
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000

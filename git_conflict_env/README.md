@@ -1,0 +1,257 @@
+# GitConflictEnv — AI Environment for Git Merge Conflict Resolution
+
+[![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-brightgreen)](https://github.com/meta-pytorch/OpenEnv)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+An OpenEnv-compliant environment where AI agents learn to resolve Git merge conflicts — a universal developer task that every software engineer encounters daily. The agent receives conflicted files (with `<<<<<<<`, `=======`, `>>>>>>>` markers), git history context, and a test suite, and must produce compilable, semantically correct, test-passing code.
+
+## 🎯 Motivation
+
+Merge conflict resolution is a **real-world task** that:
+- Every developer does regularly (estimated 3-5 times per week for active contributors)
+- Requires understanding of code semantics, not just text manipulation
+- Has clear, deterministic success criteria (code compiles, tests pass, behavior preserved)
+- Has no existing OpenEnv equivalent
+
+This environment fills a genuine gap in the RL/agent community, providing a standardized benchmark for evaluating AI coding assistants on a practical, everyday developer task.
+
+## 📐 Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│              Agent (e.g., GPT-4o)                │
+│  Reads observation → Decides action → Submits    │
+└───────────────────┬──────────────────────────────┘
+                    │ ConflictAction
+                    ▼
+┌──────────────────────────────────────────────────┐
+│           GitConflictEnvironment                 │
+│                                                  │
+│  reset(task, seed) → Initial observation         │
+│  step(action)      → Observation + reward + done │
+│  state()           → Episode metadata            │
+│                                                  │
+│  ┌─────────────┐  ┌──────────┐  ┌────────────┐  │
+│  │ Task Data   │  │ Graders  │  │  Reward    │  │
+│  │ (JSON)      │  │ (AST +   │  │  Shaping   │  │
+│  │ Seeded,     │  │  Tests + │  │  (Dense,   │  │
+│  │ Deterministic│  │  Sim)   │  │  per-step) │  │
+│  └─────────────┘  └──────────┘  └────────────┘  │
+└──────────────────────────────────────────────────┘
+```
+
+## 🎮 Action Space
+
+The agent communicates via `ConflictAction` with the following action types:
+
+| Action Type | Description | Required Fields |
+|-------------|-------------|----------------|
+| `RESOLVE_CONFLICT` | Submit resolved content for a file | `file_path`, `resolved_content` |
+| `RUN_TESTS` | Execute the test suite | — |
+| `VIEW_HISTORY` | Query git commit logs | — |
+| `SUBMIT` | Finalize resolution (triggers grading) | — |
+| `ABORT` | Give up (score = 0.0) | — |
+
+```python
+ConflictAction(
+    action_type="RESOLVE_CONFLICT",
+    file_path="utils.py",
+    resolved_content="def add(a, b):\n    return a + b\n"
+)
+```
+
+## 👁 Observation Space
+
+Each step returns a `ConflictObservation` with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `conflicted_files` | `dict[str, str]` | Current file contents (may have conflict markers) |
+| `git_log_ours` | `list[str]` | Commit messages from HEAD branch |
+| `git_log_theirs` | `list[str]` | Commit messages from feature branch |
+| `test_results` | `dict[str, bool]` | Test name → passed (after RUN_TESTS) |
+| `conflict_count` | `int` | Remaining conflict blocks |
+| `current_step` | `int` | Current step number |
+| `max_steps` | `int` | Maximum steps (50) |
+| `feedback` | `str` | Human-readable feedback |
+| `done` | `bool` | Episode terminated |
+| `reward` | `float` | Cumulative reward |
+
+## 🏆 Tasks
+
+### Task 1: Easy — Whitespace / Comment Conflict
+**Difficulty**: Easy | **Expected score**: ~0.85-0.95 for frontier models
+
+Two branches modify only formatting, comments, or blank lines in the same function. No semantic change. Agent must pick or merge trivially.
+
+**Grading**: 0.2 (no markers) + 0.3 (parses) + 0.5 × (AST similarity to ground truth)
+
+### Task 2: Medium — Concurrent Function Modification
+**Difficulty**: Medium | **Expected score**: ~0.60-0.75 for frontier models
+
+Both branches modify the same function with different but compatible logic (e.g., one adds validation, other adds logging). Agent must synthesize both changes.
+
+**Grading**: 0.1 (no markers) + 0.2 (parses) + 0.3 × (tests pass ratio) + 0.2 × (similarity) + 0.2 × (features present)
+
+### Task 3: Hard — Cross-Module Refactor Collision
+**Difficulty**: Hard | **Expected score**: ~0.30-0.50 for frontier models
+
+One branch refactors a module (extracts base classes, renames functions), other adds new features using the old API. Conflicts span 3 files.
+
+**Grading**: 0.1 (no markers) + 0.15 (parses) + 0.3 × (tests) + 0.15 × (features) + 0.15 × (no regressions) + 0.15 × (similarity)
+
+## 📊 Reward Function
+
+Dense reward signal on every step (not just at episode end):
+
+| Signal | Reward |
+|--------|--------|
+| Conflict marker block removed | +0.05 each |
+| File parses without errors | +0.15 (proportional) |
+| Step penalty (efficiency) | −0.01 per step |
+| Syntax error introduced | −0.10 |
+| ABORT | 0.0 (episode ends) |
+| Step limit reached (50) | Current score × 0.8 |
+
+Final score on SUBMIT is from the task grader, clipped to [0.0, 1.0].
+
+## 🚀 Setup & Usage
+
+### Prerequisites
+- Python 3.10+
+- pip or uv
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/YOUR_USERNAME/git-conflict-env.git
+cd git-conflict-env
+
+# Install dependencies
+pip install -e .
+
+# Or with uv
+uv sync
+```
+
+### Running Locally
+
+```python
+from git_conflict_env.server.git_conflict_environment import GitConflictEnvironment
+from git_conflict_env.models import ConflictAction
+
+env = GitConflictEnvironment()
+obs = env.reset(task="easy", seed=42)
+
+print(f"Files: {list(obs.conflicted_files.keys())}")
+print(f"Conflicts: {obs.conflict_count}")
+
+# Resolve a conflict
+obs = env.step(ConflictAction(
+    action_type="RESOLVE_CONFLICT",
+    file_path="utils.py",
+    resolved_content="def calculate_total(items):\n    return sum(items)\n"
+))
+
+# Submit for grading
+obs = env.step(ConflictAction(action_type="SUBMIT"))
+print(f"Final score: {obs.reward}")
+```
+
+### Running the Server
+
+```bash
+# Start the FastAPI server
+uvicorn git_conflict_env.server.app:app --host 0.0.0.0 --port 8000
+```
+
+### Running Tests
+
+```bash
+python -m git_conflict_env.tests.test_env
+python -m git_conflict_env.tests.test_graders
+```
+
+### Running the Baseline
+
+```bash
+OPENAI_API_KEY=sk-... python -m git_conflict_env.baseline
+```
+
+### Docker
+
+```bash
+# Build
+docker build -t git-conflict-env:latest -f server/Dockerfile .
+
+# Run
+docker run -p 8000:8000 git-conflict-env:latest
+
+# Verify
+curl http://localhost:8000/health
+```
+
+## 📈 Baseline Scores
+
+Baseline scores using GPT-4o (temperature=0, seed=42):
+
+| Task | Score | Visualization |
+|------|-------|--------------|
+| Easy | ~0.90 | █████████░ |
+| Medium | ~0.65 | ██████▌░░░ |
+| Hard | ~0.40 | ████░░░░░░ |
+| **Average** | **~0.65** | |
+
+*Scores may vary slightly between runs due to API behavior.*
+
+## 📁 Project Structure
+
+```
+git_conflict_env/
+├── __init__.py              # Package exports
+├── models.py                # ConflictAction, ConflictObservation, ConflictState
+├── graders.py               # Task-specific grading functions
+├── reward.py                # Dense reward shaping
+├── conflict_generator.py    # Generates seeded task data
+├── client.py                # EnvClient subclass
+├── baseline.py              # OpenAI API baseline script
+├── openenv.yaml             # OpenEnv manifest
+├── pyproject.toml           # Dependencies
+├── README.md                # This file
+├── tasks/
+│   ├── task_easy.json       # 3 easy episodes
+│   ├── task_medium.json     # 3 medium episodes
+│   └── task_hard.json       # 1 hard episode (multi-file)
+├── server/
+│   ├── __init__.py
+│   ├── git_conflict_environment.py  # Core environment
+│   ├── app.py               # FastAPI server
+│   └── Dockerfile           # Container image
+└── tests/
+    ├── test_env.py           # Environment tests
+    └── test_graders.py       # Grader tests
+```
+
+## 🔧 Technical Details
+
+### OpenEnv Compliance
+- ✅ Typed Pydantic models (Action, Observation, State)
+- ✅ `step(action)` → observation, reward, done
+- ✅ `reset()` → initial observation
+- ✅ `state()` → episode metadata
+- ✅ `openenv.yaml` manifest
+- ✅ Passes `openenv validate`
+
+### Determinism
+All episodes use pre-generated, seeded data stored as JSON. Same seed + same task = same episode = same grader output. This ensures reproducible baseline scores.
+
+### Episode Boundaries
+- **Start**: `reset(task=..., seed=...)`
+- **End**: `SUBMIT` (graded), `ABORT` (score 0), or step limit (50 steps, 20% penalty)
+- **Max steps**: 50 (configurable)
+
+## 📜 License
+
+MIT License
