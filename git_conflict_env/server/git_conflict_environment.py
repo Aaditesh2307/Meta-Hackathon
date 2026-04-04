@@ -1,9 +1,8 @@
 """
-GitConflictEnvironment — Core environment implementing the OpenEnv spec.
+GitReviewEnvironment — Core environment implementing the OpenEnv spec.
 
-Provides step(), reset(), and state() for AI agents learning to resolve
-Git merge conflicts. Uses pre-generated, seeded conflict scenarios for
-deterministic, reproducible episodes.
+Provides step(), reset(), and state() for AI agents learning to review
+PRs, find logic bugs, and apply fixes.
 """
 
 import copy
@@ -12,42 +11,23 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-try:
-    from openenv.core.env_server.environment import Environment
-    from openenv.core.env_server.types import Observation, State
-except ImportError:
-    from openenv.core.env_server.environment import Environment
-    from openenv.core.env_server.types import Observation, State
+from openenv.core.env_server.interfaces import Environment
+from openenv.core.env_server.types import Observation, State
 
-from ..models import ConflictAction, ConflictObservation, ConflictState
-from ..graders import grade, count_conflict_markers, run_test_suite
-from ..reward import compute_step_reward
+from models import ReviewAction, ReviewObservation, ReviewState
+from graders import grade, run_test_suite
 
 
 # Path to pre-generated task data
 TASKS_DIR = Path(__file__).parent.parent / "tasks"
 
 
-class GitConflictEnvironment(Environment):
-    """OpenEnv environment for Git merge conflict resolution.
-
-    The agent receives conflicted files (with <<<<<<<, =======, >>>>>>> markers),
-    git history context, and must produce clean, test-passing resolutions.
-
-    Supports 3 difficulty levels:
-      - easy:   Whitespace/comment conflicts
-      - medium: Concurrent function modifications
-      - hard:   Cross-module refactor collisions
-
-    Episode ends when:
-      - Agent calls SUBMIT (triggers final grading)
-      - Agent calls ABORT (score = 0.0)
-      - Step limit (50) is reached
-    """
+class GitReviewEnvironment(Environment):
+    """OpenEnv environment for Code Review and Bug Fixing."""
 
     def __init__(self):
         super().__init__()
-        self._state = ConflictState()
+        self._state = ReviewState()
         self._task_data = {}
         self._prev_files = {}
 
@@ -56,24 +36,13 @@ class GitConflictEnvironment(Environment):
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
         **kwargs: Any,
-    ) -> ConflictObservation:
-        """Reset the environment and start a new episode.
-
-        Args:
-            seed: Random seed (selects episode variant). Default: 0 (first episode).
-            episode_id: Optional custom episode ID.
-            **kwargs: Additional options. Supports 'task' (str): 'easy', 'medium', or 'hard'.
-
-        Returns:
-            Initial observation with conflicted files and context.
-        """
+    ) -> ReviewObservation:
         task_id = kwargs.get("task", "easy")
         episode_idx = kwargs.get("episode_idx", 0)
 
-        # Load task data
         task_file = TASKS_DIR / f"task_{task_id}.json"
         if not task_file.exists():
-            return ConflictObservation(
+            return ReviewObservation(
                 done=True,
                 reward=0.0,
                 feedback=f"Task file not found: {task_file}",
@@ -85,115 +54,85 @@ class GitConflictEnvironment(Environment):
 
         episodes = task_data.get("episodes", [])
         if not episodes:
-            return ConflictObservation(
+            return ReviewObservation(
                 done=True,
                 reward=0.0,
                 feedback="No episodes available for this task",
                 metadata={"error": "no_episodes"},
             )
 
-        # Select episode by seed or index
         if seed is not None:
-            # Find episode matching seed, or use modulo
             matching = [e for e in episodes if e.get("seed") == seed]
             episode = matching[0] if matching else episodes[seed % len(episodes)]
         else:
             episode = episodes[episode_idx % len(episodes)]
 
-        # Count total conflict markers
-        total_conflicts = sum(
-            count_conflict_markers(c)
-            for c in episode["conflicted_files"].values()
-        )
-
-        # Initialize state
-        self._state = ConflictState(
+        self._state = ReviewState(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
             task_id=task_id,
-            current_files=copy.deepcopy(episode["conflicted_files"]),
+            current_files=copy.deepcopy(episode["current_files"]),
             ground_truth=episode["ground_truth"],
-            original_conflict_count=total_conflicts,
-            resolved_conflict_count=0,
+            pr_diff=episode.get("pr_diff", ""),
+            comment_threads=[],
             total_reward=0.0,
             max_steps=50,
             is_done=False,
             test_suite=episode.get("test_suite", {}),
-            git_log_ours=episode.get("git_log_ours", []),
-            git_log_theirs=episode.get("git_log_theirs", []),
             seed=episode.get("seed"),
         )
 
         self._task_data = task_data
-        self._prev_files = copy.deepcopy(episode["conflicted_files"])
+        self._prev_files = copy.deepcopy(episode["current_files"])
 
-        return ConflictObservation(
+        return ReviewObservation(
             done=False,
             reward=0.0,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            git_log_ours=self._state.git_log_ours,
-            git_log_theirs=self._state.git_log_theirs,
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=[],
             test_results=None,
-            conflict_count=total_conflicts,
             task_description=task_data.get("description", ""),
             current_step=0,
             max_steps=self._state.max_steps,
-            feedback="Episode started. Resolve the merge conflicts.",
+            feedback="Episode started. Review the PR diff and find any bugs.",
             metadata={
                 "task_id": task_id,
-                "total_files": len(episode["conflicted_files"]),
-                "total_conflicts": total_conflicts,
+                "total_files": len(episode["current_files"]),
             },
         )
 
     def step(
         self,
-        action: ConflictAction,
+        action: ReviewAction,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
-    ) -> ConflictObservation:
-        """Execute an action and return the resulting observation.
-
-        Args:
-            action: The ConflictAction to execute.
-            timeout_s: Optional timeout (unused).
-
-        Returns:
-            ConflictObservation with updated state, reward, and feedback.
-        """
+    ) -> ReviewObservation:
         if self._state.is_done:
             return self._make_done_observation(
                 "Episode already finished. Call reset() to start a new episode."
             )
 
-        # Increment step count
         self._state.step_count += 1
-
-        # Save previous state for reward computation
         prev_files = copy.deepcopy(self._state.current_files)
 
-        # ── Handle action types ──
         if action.action_type == "ABORT":
             return self._handle_abort()
-
-        elif action.action_type == "VIEW_HISTORY":
-            return self._handle_view_history()
-
         elif action.action_type == "RUN_TESTS":
-            return self._handle_run_tests(prev_files)
-
-        elif action.action_type == "RESOLVE_CONFLICT":
-            return self._handle_resolve(action, prev_files)
-
-        elif action.action_type == "SUBMIT":
-            return self._handle_submit(prev_files)
-
+            return self._handle_run_tests()
+        elif action.action_type == "POST_COMMENT":
+            return self._handle_post_comment(action)
+        elif action.action_type == "SUBMIT_PATCH":
+            return self._handle_submit_patch(action)
+        elif action.action_type == "APPROVE_PR":
+            return self._handle_approve()
         else:
-            return ConflictObservation(
+            return ReviewObservation(
                 done=False,
                 reward=self._state.total_reward,
-                conflicted_files=copy.deepcopy(self._state.current_files),
-                conflict_count=self._current_conflict_count(),
+                current_files=copy.deepcopy(self._state.current_files),
+                pr_diff=self._state.pr_diff,
+                comment_threads=copy.deepcopy(self._state.comment_threads),
                 task_description=self._task_data.get("description", ""),
                 current_step=self._state.step_count,
                 max_steps=self._state.max_steps,
@@ -202,257 +141,150 @@ class GitConflictEnvironment(Environment):
             )
 
     @property
-    def state(self) -> ConflictState:
-        """Get the current environment state."""
+    def state(self) -> ReviewState:
         return self._state
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Action handlers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _handle_abort(self) -> ConflictObservation:
-        """Handle ABORT action — end episode with 0.0 score."""
+    def _handle_abort(self) -> ReviewObservation:
         self._state.is_done = True
         self._state.total_reward = 0.0
-        return ConflictObservation(
-            done=True,
-            reward=0.0,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            conflict_count=self._current_conflict_count(),
-            task_description=self._task_data.get("description", ""),
-            current_step=self._state.step_count,
-            max_steps=self._state.max_steps,
-            feedback="Episode aborted. Final score: 0.0",
-            metadata={"aborted": True, "final_score": 0.0},
-        )
+        return self._make_done_observation("Episode aborted. Final score: 0.0")
 
-    def _handle_view_history(self) -> ConflictObservation:
-        """Handle VIEW_HISTORY — return git logs (costs a step)."""
-        step_reward, reason, info = compute_step_reward(
-            self._state.current_files,
-            self._state.current_files,
-            self._state.test_suite,
-            self._state.step_count,
-            "VIEW_HISTORY",
-            self._state.original_conflict_count,
-        )
-        self._state.total_reward += step_reward
-
-        # Check step limit
-        if self._state.step_count >= self._state.max_steps:
-            return self._handle_step_limit()
-
-        return ConflictObservation(
-            done=False,
-            reward=self._state.total_reward,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            git_log_ours=self._state.git_log_ours,
-            git_log_theirs=self._state.git_log_theirs,
-            conflict_count=self._current_conflict_count(),
-            task_description=self._task_data.get("description", ""),
-            current_step=self._state.step_count,
-            max_steps=self._state.max_steps,
-            feedback=f"Git history retrieved. {reason}",
-            metadata={"git_log_shown": True},
-        )
-
-    def _handle_run_tests(
-        self, prev_files: dict
-    ) -> ConflictObservation:
-        """Handle RUN_TESTS — execute test suite (costs a step)."""
+    def _handle_run_tests(self) -> ReviewObservation:
         test_results = run_test_suite(
             self._state.current_files, self._state.test_suite
         )
-
-        step_reward, reason, info = compute_step_reward(
-            prev_files,
-            self._state.current_files,
-            self._state.test_suite,
-            self._state.step_count,
-            "RUN_TESTS",
-            self._state.original_conflict_count,
-        )
-        self._state.total_reward += step_reward
+        passed = sum(1 for v in test_results.values() if v)
+        total = len(test_results)
+        self._state.total_reward -= 0.01  # small penalty for taking a step
 
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
 
-        passed = sum(1 for v in test_results.values() if v)
-        total = len(test_results)
-
-        return ConflictObservation(
+        return ReviewObservation(
             done=False,
             reward=self._state.total_reward,
-            conflicted_files=copy.deepcopy(self._state.current_files),
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
             test_results=test_results,
-            conflict_count=self._current_conflict_count(),
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
-            feedback=f"Tests: {passed}/{total} passed. {reason}",
+            feedback=f"Tests: {passed}/{total} passed.",
             metadata={"tests_run": True, "passed": passed, "total": total},
         )
 
-    def _handle_resolve(
-        self, action: ConflictAction, prev_files: dict
-    ) -> ConflictObservation:
-        """Handle RESOLVE_CONFLICT — update file content."""
-        if not action.file_path:
-            return ConflictObservation(
-                done=False,
-                reward=self._state.total_reward,
-                conflicted_files=copy.deepcopy(self._state.current_files),
-                conflict_count=self._current_conflict_count(),
-                task_description=self._task_data.get("description", ""),
-                current_step=self._state.step_count,
-                max_steps=self._state.max_steps,
-                feedback="Error: file_path is required for RESOLVE_CONFLICT",
-                metadata={"error": "missing_file_path"},
-            )
+    def _handle_post_comment(self, action: ReviewAction) -> ReviewObservation:
+        if not action.comment:
+            return self._make_error_obs("comment is required for POST_COMMENT")
+        
+        entry = f"[{action.file_path or 'Global'} L{action.line_number or '?'}] {action.comment}"
+        self._state.comment_threads.append(entry)
+        
+        self._state.total_reward += 0.05  # small reward for interacting
+        
+        if self._state.step_count >= self._state.max_steps:
+            return self._handle_step_limit()
 
+        return ReviewObservation(
+            done=False,
+            reward=self._state.total_reward,
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
+            task_description=self._task_data.get("description", ""),
+            current_step=self._state.step_count,
+            max_steps=self._state.max_steps,
+            feedback="Comment posted successfully.",
+        )
+
+    def _handle_submit_patch(self, action: ReviewAction) -> ReviewObservation:
+        if not action.file_path or action.resolved_content is None:
+            return self._make_error_obs("file_path and resolved_content required for SUBMIT_PATCH")
+        
         if action.file_path not in self._state.current_files:
-            return ConflictObservation(
-                done=False,
-                reward=self._state.total_reward,
-                conflicted_files=copy.deepcopy(self._state.current_files),
-                conflict_count=self._current_conflict_count(),
-                task_description=self._task_data.get("description", ""),
-                current_step=self._state.step_count,
-                max_steps=self._state.max_steps,
-                feedback=f"Error: file '{action.file_path}' not found. "
-                f"Available files: {list(self._state.current_files.keys())}",
-                metadata={"error": "file_not_found"},
-            )
+            return self._make_error_obs(f"file '{action.file_path}' not found.")
 
-        if action.resolved_content is None:
-            return ConflictObservation(
-                done=False,
-                reward=self._state.total_reward,
-                conflicted_files=copy.deepcopy(self._state.current_files),
-                conflict_count=self._current_conflict_count(),
-                task_description=self._task_data.get("description", ""),
-                current_step=self._state.step_count,
-                max_steps=self._state.max_steps,
-                feedback="Error: resolved_content is required for RESOLVE_CONFLICT",
-                metadata={"error": "missing_content"},
-            )
-
-        # Apply the resolution
         self._state.current_files[action.file_path] = action.resolved_content
-
-        # Compute step reward
-        step_reward, reason, info = compute_step_reward(
-            prev_files,
-            self._state.current_files,
-            self._state.test_suite,
-            self._state.step_count,
-            "RESOLVE_CONFLICT",
-            self._state.original_conflict_count,
-        )
-        self._state.total_reward += step_reward
-
-        # Update conflict count
-        curr_conflicts = self._current_conflict_count()
-        self._state.resolved_conflict_count = (
-            self._state.original_conflict_count - curr_conflicts
-        )
+        self._state.total_reward -= 0.01
 
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
 
-        return ConflictObservation(
+        return ReviewObservation(
             done=False,
             reward=self._state.total_reward,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            conflict_count=curr_conflicts,
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
-            feedback=f"File '{action.file_path}' updated. {reason}",
-            metadata=info,
+            feedback=f"Patch applied to '{action.file_path}'.",
         )
 
-    def _handle_submit(self, prev_files: dict) -> ConflictObservation:
-        """Handle SUBMIT — run final grading and end episode."""
+    def _handle_approve(self) -> ReviewObservation:
         self._state.is_done = True
-
-        # Run the full grader
+        
         final_score, grader_info = grade(
             self._state.task_id,
             self._state.current_files,
             self._state.ground_truth,
             self._state.test_suite,
+            self._state.comment_threads
         )
-
+        
         self._state.total_reward = final_score
 
-        return ConflictObservation(
+        return ReviewObservation(
             done=True,
             reward=final_score,
-            conflicted_files=copy.deepcopy(self._state.current_files),
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
             test_results=grader_info.get("tests_detail"),
-            conflict_count=self._current_conflict_count(),
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
-            feedback=f"Episode complete. Final score: {final_score:.4f}",
-            metadata={
-                "final_score": final_score,
-                "grader_breakdown": grader_info,
-                "submitted": True,
-            },
+            feedback=f"PR Approved. Final score: {final_score:.4f}",
+            metadata={"final_score": final_score, "grader_breakdown": grader_info},
         )
 
-    def _handle_step_limit(self) -> ConflictObservation:
-        """Handle step limit reached — auto-submit."""
+    def _handle_step_limit(self) -> ReviewObservation:
         self._state.is_done = True
-
         final_score, grader_info = grade(
             self._state.task_id,
             self._state.current_files,
             self._state.ground_truth,
             self._state.test_suite,
+            self._state.comment_threads
         )
-
-        # Apply penalty for not finishing within limits
-        final_score = max(final_score * 0.8, 0.0)  # 20% penalty
+        final_score = max(final_score * 0.8, 0.0)
         self._state.total_reward = final_score
 
-        return ConflictObservation(
-            done=True,
-            reward=final_score,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            test_results=grader_info.get("tests_detail"),
-            conflict_count=self._current_conflict_count(),
+        return self._make_done_observation(f"Step limit reached. Final score: {final_score:.4f}")
+
+    def _make_error_obs(self, msg: str) -> ReviewObservation:
+        return ReviewObservation(
+            done=False,
+            reward=self._state.total_reward,
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
-            feedback=f"Step limit reached. Final score: {final_score:.4f} (includes 20% penalty)",
-            metadata={
-                "final_score": final_score,
-                "grader_breakdown": grader_info,
-                "step_limit_reached": True,
-            },
+            feedback=f"Error: {msg}",
+            metadata={"error": "invalid_action_params"},
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Helpers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _current_conflict_count(self) -> int:
-        """Count remaining conflict blocks across all files."""
-        return sum(
-            count_conflict_markers(c)
-            for c in self._state.current_files.values()
-        )
-
-    def _make_done_observation(self, feedback: str) -> ConflictObservation:
-        """Create a terminal observation."""
-        return ConflictObservation(
+    def _make_done_observation(self, feedback: str) -> ReviewObservation:
+        return ReviewObservation(
             done=True,
             reward=self._state.total_reward,
-            conflicted_files=copy.deepcopy(self._state.current_files),
-            conflict_count=self._current_conflict_count(),
+            current_files=copy.deepcopy(self._state.current_files),
+            pr_diff=self._state.pr_diff,
+            comment_threads=copy.deepcopy(self._state.comment_threads),
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,

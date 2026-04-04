@@ -1,66 +1,18 @@
 {
   "task_id": "easy",
-  "description": "Whitespace / Comment Conflict: Two branches modify only formatting, comments, or blank lines in the same function. No semantic change. Agent must pick or merge trivially.",
+  "description": "Simple PR Bug Fix: Find the logic error in the codebase and submit a patch.",
   "episodes": [
     {
       "seed": 42,
-      "conflicted_files": {
-        "utils.py": "def calculate_total(items, tax_rate=0.1):\n    \"\"\"Calculate the total price with tax.\"\"\"\n<<<<<<< HEAD\n    # Calculate subtotal first\n    subtotal = sum(item[\"price\"] * item[\"quantity\"] for item in items)\n    \n    # Apply tax\n    tax = subtotal * tax_rate\n    total = subtotal + tax\n=======\n    # Sum up all items\n    subtotal = sum(\n        item[\"price\"] * item[\"quantity\"]\n        for item in items\n    )\n    # Tax calculation\n    tax = subtotal * tax_rate\n    total = subtotal + tax\n>>>>>>> feature/format-cleanup\n    return round(total, 2)\n\n\ndef format_currency(amount):\n    \"\"\"Format a number as currency.\"\"\"\n    return f\"${amount:,.2f}\"\n"
+      "current_files": {
+        "utils.py": "def calculate_total(items, tax_rate=0.1):\n    \"\"\"Calculate the total price with tax.\"\"\"\n    # Calculate subtotal first\n    subtotal = sum(item[\"price\"] + item[\"quantity\"] for item in items)\n    \n    # Apply tax\n    tax = subtotal * tax_rate\n    total = subtotal + tax\n    return round(total, 2)\n"
       },
-      "git_log_ours": [
-        "abc1234 Standardize comment style in utils.py",
-        "def5678 Add inline comments for clarity"
-      ],
-      "git_log_theirs": [
-        "111aaaa Reformat calculate_total for readability",
-        "222bbbb Apply black formatter to utils.py"
-      ],
+      "pr_diff": "--- a/utils.py\n+++ b/utils.py\n@@ -1,7 +1,7 @@\n def calculate_total(items, tax_rate=0.1):\n     \"\"\"Calculate the total price with tax.\"\"\"\n     # Calculate subtotal first\n-    subtotal = sum(item[\"price\"] * item[\"quantity\"] for item in items)\n+    subtotal = sum(item[\"price\"] + item[\"quantity\"] for item in items)\n     \n     # Apply tax\n     tax = subtotal * tax_rate",
       "ground_truth": {
-        "utils.py": "def calculate_total(items, tax_rate=0.1):\n    \"\"\"Calculate the total price with tax.\"\"\"\n    # Calculate subtotal first\n    subtotal = sum(\n        item[\"price\"] * item[\"quantity\"]\n        for item in items\n    )\n    # Apply tax\n    tax = subtotal * tax_rate\n    total = subtotal + tax\n    return round(total, 2)\n\n\ndef format_currency(amount):\n    \"\"\"Format a number as currency.\"\"\"\n    return f\"${amount:,.2f}\"\n"
+        "utils.py": "def calculate_total(items, tax_rate=0.1):\n    \"\"\"Calculate the total price with tax.\"\"\"\n    # Calculate subtotal first\n    subtotal = sum(item[\"price\"] * item[\"quantity\"] for item in items)\n    \n    # Apply tax\n    tax = subtotal * tax_rate\n    total = subtotal + tax\n    return round(total, 2)\n"
       },
       "test_suite": {
-        "test_calculate_total": "def test_calculate_total():\n    items = [{\"price\": 10.0, \"quantity\": 2}, {\"price\": 5.0, \"quantity\": 3}]\n    result = calculate_total(items, tax_rate=0.1)\n    assert result == 38.5, f\"Expected 38.5, got {result}\"\n    return True\n",
-        "test_format_currency": "def test_format_currency():\n    assert format_currency(1234.5) == \"$1,234.50\"\n    return True\n"
-      }
-    },
-    {
-      "seed": 123,
-      "conflicted_files": {
-        "validators.py": "\"\"\"Input validation utilities.\"\"\"\n\n\ndef validate_email(email):\n<<<<<<< HEAD\n    \"\"\"Validate an email address format.\n    \n    Args:\n        email: The email string to validate.\n    \n    Returns:\n        bool: True if the email is valid.\n    \"\"\"\n    if not isinstance(email, str):\n        return False\n    parts = email.split(\"@\")\n=======\n    \"\"\"Check if email is valid.\"\"\"\n    if not isinstance(email, str):\n        return False\n\n    parts = email.split(\"@\")\n>>>>>>> feature/simplify-docs\n    if len(parts) != 2:\n        return False\n    return \".\" in parts[1]\n\n\ndef validate_age(age):\n    \"\"\"Validate age is a positive integer.\"\"\"\n    return isinstance(age, int) and 0 < age < 150\n"
-      },
-      "git_log_ours": [
-        "aaa1111 Expand docstrings with Args/Returns",
-        "bbb2222 Follow Google docstring convention"
-      ],
-      "git_log_theirs": [
-        "ccc3333 Simplify docstrings for brevity",
-        "ddd4444 Add blank lines between logical blocks"
-      ],
-      "ground_truth": {
-        "validators.py": "\"\"\"Input validation utilities.\"\"\"\n\n\ndef validate_email(email):\n    \"\"\"Validate an email address format.\n\n    Args:\n        email: The email string to validate.\n\n    Returns:\n        bool: True if the email is valid.\n    \"\"\"\n    if not isinstance(email, str):\n        return False\n\n    parts = email.split(\"@\")\n    if len(parts) != 2:\n        return False\n    return \".\" in parts[1]\n\n\ndef validate_age(age):\n    \"\"\"Validate age is a positive integer.\"\"\"\n    return isinstance(age, int) and 0 < age < 150\n"
-      },
-      "test_suite": {
-        "test_validate_email_valid": "def test_validate_email_valid():\n    assert validate_email(\"user@example.com\") == True\n    return True\n",
-        "test_validate_email_invalid": "def test_validate_email_invalid():\n    assert validate_email(\"not-an-email\") == False\n    assert validate_email(123) == False\n    return True\n",
-        "test_validate_age": "def test_validate_age():\n    assert validate_age(25) == True\n    assert validate_age(-1) == False\n    assert validate_age(200) == False\n    return True\n"
-      }
-    },
-    {
-      "seed": 256,
-      "conflicted_files": {
-        "config.py": "\"\"\"Application configuration module.\"\"\"\n\n<<<<<<< HEAD\nimport os\nimport sys\nfrom pathlib import Path\n\n# Default configuration values\nDEFAULT_PORT = 8080\nDEFAULT_HOST = \"0.0.0.0\"\nDEBUG = os.getenv(\"DEBUG\", \"false\").lower() == \"true\"\n=======\nimport os\nimport sys\n\nfrom pathlib import Path\n\n# Configuration defaults\nDEFAULT_PORT = 8080\nDEFAULT_HOST = \"0.0.0.0\"\nDEBUG = os.getenv(\"DEBUG\", \"false\").lower() == \"true\"\n>>>>>>> feature/isort-cleanup\n\n\ndef get_config():\n    \"\"\"Return the current configuration as a dict.\"\"\"\n    return {\n        \"port\": int(os.getenv(\"PORT\", DEFAULT_PORT)),\n        \"host\": os.getenv(\"HOST\", DEFAULT_HOST),\n        \"debug\": DEBUG,\n    }\n"
-      },
-      "git_log_ours": [
-        "eee5555 Group imports and add comments"
-      ],
-      "git_log_theirs": [
-        "fff6666 Run isort on config.py"
-      ],
-      "ground_truth": {
-        "config.py": "\"\"\"Application configuration module.\"\"\"\n\nimport os\nimport sys\nfrom pathlib import Path\n\n# Default configuration values\nDEFAULT_PORT = 8080\nDEFAULT_HOST = \"0.0.0.0\"\nDEBUG = os.getenv(\"DEBUG\", \"false\").lower() == \"true\"\n\n\ndef get_config():\n    \"\"\"Return the current configuration as a dict.\"\"\"\n    return {\n        \"port\": int(os.getenv(\"PORT\", DEFAULT_PORT)),\n        \"host\": os.getenv(\"HOST\", DEFAULT_HOST),\n        \"debug\": DEBUG,\n    }\n"
-      },
-      "test_suite": {
-        "test_get_config": "def test_get_config():\n    config = get_config()\n    assert \"port\" in config\n    assert \"host\" in config\n    assert \"debug\" in config\n    assert isinstance(config[\"port\"], int)\n    return True\n"
+        "test_calculate_total": "def test_calculate_total():\n    items = [{\"price\": 10.0, \"quantity\": 2}, {\"price\": 5.0, \"quantity\": 3}]\n    result = calculate_total(items, tax_rate=0.1)\n    assert result == 38.5, f\"Expected 38.5, got {result}\"\n    return True\n"
       }
     }
   ]

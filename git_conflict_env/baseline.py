@@ -1,87 +1,68 @@
 #!/usr/bin/env python3
 """
-Baseline Inference Script for GitConflictEnv.
+Baseline Inference Script for GitReviewEnvironment.
 
-Uses the OpenAI API client to run a model (GPT-4o) against all 3 tasks,
-producing reproducible baseline scores.
-
-Usage:
-    OPENAI_API_KEY=sk-... python baseline.py
-
-Environment Variables:
-    OPENAI_API_KEY: Your OpenAI API key (required)
-    OPENAI_MODEL:   Model to use (default: gpt-4o)
-
-Expected Baseline Scores (GPT-4o, seed=42):
-    Task easy:   ~0.85-0.95
-    Task medium: ~0.60-0.75
-    Task hard:   ~0.30-0.50
+Uses the OpenAI API client to run an autonomous review model against tasks.
 """
 
 import json
 import os
 import sys
 import time
+from dotenv import load_dotenv
 
-# Add parent to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+load_dotenv()
 
 from openai import OpenAI
-from models import ConflictAction, ConflictObservation
-from server.git_conflict_environment import GitConflictEnvironment
+from models import ReviewAction, ReviewObservation
+from server.git_conflict_environment import GitReviewEnvironment
 
 
 def build_system_prompt() -> str:
-    """Build the system prompt for the merge conflict resolution agent."""
-    return """You are an expert software engineer specialized in resolving Git merge conflicts.
+    return """You are an expert software engineer performing an autonomous code review.
 
-You receive files containing Git conflict markers (<<<<<<< HEAD, =======, >>>>>>> branch).
-Your task is to resolve these conflicts by producing clean, correct code that:
-1. Removes all conflict markers
-2. Integrates changes from both branches when they are compatible
-3. Preserves all functionality from both branches
-4. Produces valid, parseable Python code
+You will receive a PR diff to review and the current state of files.
+Your task is to review the code, find any logic bugs or issues, leave a comment if necessary, and optionally submit a patch to fix it.
 
-When resolving, prefer:
-- Keeping BOTH changes if they are compatible (don't just pick one side)
-- Maintaining proper code formatting and style
-- Ensuring the code logically makes sense when both changes are merged
-
-You will respond with a JSON action. The action types are:
-- RESOLVE_CONFLICT: Submit resolved file content
-  {"action_type": "RESOLVE_CONFLICT", "file_path": "filename.py", "resolved_content": "..."}
-- RUN_TESTS: Run the test suite to check your resolution
+Action Types (Respond with JSON):
+- POST_COMMENT: Leave a review comment on a file.
+  {"action_type": "POST_COMMENT", "file_path": "filename.py", "line_number": 10, "comment": "This looks wrong because..."}
+- SUBMIT_PATCH: Submit the completely fixed file content.
+  {"action_type": "SUBMIT_PATCH", "file_path": "filename.py", "resolved_content": "..."}
+- RUN_TESTS: Run the test suite to verify your patch.
   {"action_type": "RUN_TESTS"}
-- SUBMIT: Finalize your resolution (triggers grading)
-  {"action_type": "SUBMIT"}
+- APPROVE_PR: Approve the code and finish the review.
+  {"action_type": "APPROVE_PR"}
 
-Workflow: Resolve all conflicts → optionally RUN_TESTS → SUBMIT."""
+Workflow: Read Diff -> POST_COMMENT -> SUBMIT_PATCH -> RUN_TESTS -> APPROVE_PR."""
 
 
 def build_step_prompt(obs_data: dict) -> str:
-    """Build the user prompt from an observation."""
-    parts = ["Current state of the merge conflict resolution:\n"]
+    parts = ["Current state of the PR Review:\n"]
 
-    # Show conflicted files
-    files = obs_data.get("conflicted_files", {})
+    if obs_data.get("pr_diff"):
+        parts.append("=== PR DIFF ===\n")
+        parts.append(obs_data["pr_diff"])
+        parts.append("\n")
+
+    files = obs_data.get("current_files", {})
     if files:
-        parts.append("=== FILES (may contain conflict markers) ===\n")
+        parts.append("=== CURRENT FILES ===\n")
         for path, content in files.items():
             parts.append(f"--- {path} ---")
             parts.append(content)
-            parts.append("")
+            parts.append("\n")
 
-    # Show conflict count
-    conflicts = obs_data.get("conflict_count", 0)
-    parts.append(f"Remaining conflicts: {conflicts}")
-    parts.append(f"Step: {obs_data.get('current_step', 0)}/{obs_data.get('max_steps', 50)}")
-
-    # Show feedback
+    threads = obs_data.get("comment_threads", [])
+    if threads:
+        parts.append("=== COMMENTS ===")
+        for thread in threads:
+            parts.append(f"  {thread}")
+            
     feedback = obs_data.get("feedback", "")
     if feedback:
         parts.append(f"\nFeedback: {feedback}")
 
-    # Show test results if available
     test_results = obs_data.get("test_results")
     if test_results:
         parts.append("\n=== TEST RESULTS ===")
@@ -89,32 +70,12 @@ def build_step_prompt(obs_data: dict) -> str:
             status = "✓ PASSED" if passed else "✗ FAILED"
             parts.append(f"  {name}: {status}")
 
-    # Show git logs
-    git_ours = obs_data.get("git_log_ours", [])
-    git_theirs = obs_data.get("git_log_theirs", [])
-    if git_ours or git_theirs:
-        parts.append("\n=== GIT HISTORY ===")
-        if git_ours:
-            parts.append("Ours (HEAD):")
-            for log in git_ours:
-                parts.append(f"  {log}")
-        if git_theirs:
-            parts.append("Theirs (feature branch):")
-            for log in git_theirs:
-                parts.append(f"  {log}")
-
-    parts.append("\nRespond with a single JSON action. If conflicts remain, use RESOLVE_CONFLICT. "
-                 "If all conflicts are resolved, use SUBMIT.")
-
+    parts.append("\nRespond with a single JSON action.")
     return "\n".join(parts)
 
 
-def parse_action(response_text: str) -> ConflictAction:
-    """Parse the model response into a ConflictAction."""
-    # Try to extract JSON from the response
+def parse_action(response_text: str) -> ReviewAction:
     text = response_text.strip()
-
-    # Handle markdown code blocks
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0].strip()
     elif "```" in text:
@@ -122,44 +83,39 @@ def parse_action(response_text: str) -> ConflictAction:
 
     try:
         data = json.loads(text)
-        return ConflictAction(**data)
+        return ReviewAction(**data)
     except (json.JSONDecodeError, Exception) as e:
-        # If we can't parse, default to SUBMIT to avoid infinite loops
-        print(f"  ⚠ Parse error: {e}. Defaulting to SUBMIT.")
-        return ConflictAction(action_type="SUBMIT")
+        print(f"  ⚠ Parse error: {e}. Defaulting to APPROVE_PR.")
+        return ReviewAction(action_type="APPROVE_PR")
 
 
 def run_baseline(
-    model: str = "gpt-4o",
+    model: str = "openai/gpt-oss-120b",
     seed: int = 42,
     verbose: bool = True,
 ) -> dict:
-    """Run the baseline agent against all 3 tasks.
+    # Use GROQ_API_KEY if present, otherwise fallback to OPENAI_API_KEY
+    api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("GROQ_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
 
-    Args:
-        model: OpenAI model name
-        seed: Episode seed for reproducibility
-        verbose: Print progress
-
-    Returns:
-        Dict mapping task_id → final_score
-    """
-    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable not set.")
-        print("Usage: OPENAI_API_KEY=sk-... python baseline.py")
+        print("ERROR: GROQ_API_KEY or OPENAI_API_KEY environment variable not set.")
         sys.exit(1)
 
-    client = OpenAI(api_key=api_key)
+    # Note: Using base_url allows redirecting to OpenRouter, Groq, etc. 
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url if base_url else None
+    )
     results = {}
 
-    for task_id in ["easy", "medium", "hard"]:
+    for task_id in ["easy"]:  # Reduced to only easy for now since others aren't ready
         if verbose:
             print(f"\n{'='*60}")
             print(f"Task: {task_id} (seed={seed})")
             print(f"{'='*60}")
 
-        env = GitConflictEnvironment()
+        env = GitReviewEnvironment()
         obs = env.reset(seed=seed, task=task_id)
         obs_data = obs.model_dump()
 
@@ -168,7 +124,7 @@ def run_baseline(
         ]
 
         step = 0
-        max_agent_steps = 10  # Safety limit for API calls
+        max_agent_steps = 10
 
         while not obs_data.get("done", False) and step < max_agent_steps:
             step += 1
@@ -183,7 +139,7 @@ def run_baseline(
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.0,  # Deterministic
+                    temperature=0.0,
                     max_tokens=4096,
                 )
 
@@ -199,15 +155,14 @@ def run_baseline(
                     print()
 
             except Exception as e:
-                print(f"  ⚠ API error: {e}. Submitting current state.")
-                action = ConflictAction(action_type="SUBMIT")
+                print(f"  ⚠ API error: {e}. Approving PR.")
+                action = ReviewAction(action_type="APPROVE_PR")
 
             obs = env.step(action)
             obs_data = obs.model_dump()
 
             if verbose:
                 print(f"  Reward: {obs_data.get('reward', 0):.4f}")
-                print(f"  Conflicts remaining: {obs_data.get('conflict_count', '?')}")
                 if obs_data.get("feedback"):
                     print(f"  Feedback: {obs_data['feedback'][:100]}")
 
@@ -217,7 +172,6 @@ def run_baseline(
         if verbose:
             print(f"\n  ✓ Final score: {final_score:.4f}")
 
-    # Summary
     if verbose:
         print(f"\n{'='*60}")
         print("BASELINE RESULTS SUMMARY")
