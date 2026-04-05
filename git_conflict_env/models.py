@@ -7,7 +7,7 @@ interface contract between the environment server and client/agent.
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 
 from openenv.core.env_server.types import Action, Observation, State
 
@@ -35,6 +35,8 @@ class ReviewAction(Action):
 
     resolved_content: Optional[str] = Field(
         default=None,
+        validation_alias=AliasChoices("resolved_content", "patched_content"),
+        serialization_alias="resolved_content",
         description="The full file content containing the bug fix "
         "(required for SUBMIT_PATCH)",
     )

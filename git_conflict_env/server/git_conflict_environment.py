@@ -15,7 +15,7 @@ from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import Observation, State
 
 from models import ReviewAction, ReviewObservation, ReviewState
-from graders import grade, run_test_suite
+from graders import ast_similarity, grade, run_test_suite
 
 
 # Path to pre-generated task data
@@ -30,6 +30,10 @@ class GitReviewEnvironment(Environment):
         self._state = ReviewState()
         self._task_data = {}
         self._prev_files = {}
+        self._reward_flags = {
+            "comment_rewarded": False,
+            "last_test_pass_ratio": 0.0,
+        }
 
     def reset(
         self,
@@ -67,11 +71,20 @@ class GitReviewEnvironment(Environment):
         else:
             episode = episodes[episode_idx % len(episodes)]
 
+        files = episode.get("current_files") or episode.get("conflicted_files")
+        if not files:
+            return ReviewObservation(
+                done=True,
+                reward=0.0,
+                feedback="Episode is missing current_files/conflicted_files",
+                metadata={"error": "invalid_episode_format"},
+            )
+
         self._state = ReviewState(
             episode_id=episode_id or str(uuid4()),
             step_count=0,
             task_id=task_id,
-            current_files=copy.deepcopy(episode["current_files"]),
+            current_files=copy.deepcopy(files),
             ground_truth=episode["ground_truth"],
             pr_diff=episode.get("pr_diff", ""),
             comment_threads=[],
@@ -83,7 +96,11 @@ class GitReviewEnvironment(Environment):
         )
 
         self._task_data = task_data
-        self._prev_files = copy.deepcopy(episode["current_files"])
+        self._prev_files = copy.deepcopy(files)
+        self._reward_flags = {
+            "comment_rewarded": False,
+            "last_test_pass_ratio": 0.0,
+        }
 
         return ReviewObservation(
             done=False,
@@ -98,7 +115,7 @@ class GitReviewEnvironment(Environment):
             feedback="Episode started. Review the PR diff and find any bugs.",
             metadata={
                 "task_id": task_id,
-                "total_files": len(episode["current_files"]),
+                "total_files": len(files),
             },
         )
 
@@ -115,6 +132,9 @@ class GitReviewEnvironment(Environment):
 
         self._state.step_count += 1
         prev_files = copy.deepcopy(self._state.current_files)
+
+        # Balanced efficiency pressure: keep this small so progress remains visible.
+        self._apply_reward_delta(-0.01)
 
         if action.action_type == "ABORT":
             return self._handle_abort()
@@ -155,7 +175,20 @@ class GitReviewEnvironment(Environment):
         )
         passed = sum(1 for v in test_results.values() if v)
         total = len(test_results)
-        self._state.total_reward -= 0.01  # small penalty for taking a step
+        pass_ratio = (passed / total) if total > 0 else 0.0
+
+        # Reward only *improvement* in test pass ratio to avoid reward farming.
+        previous_ratio = float(self._reward_flags.get("last_test_pass_ratio", 0.0))
+        improvement = pass_ratio - previous_ratio
+        if improvement > 0:
+            self._apply_reward_delta(0.4 * improvement)
+        elif improvement < 0:
+            self._apply_reward_delta(-0.1 * abs(improvement))
+
+        if total > 0 and passed == 0:
+            self._apply_reward_delta(-0.1)
+
+        self._reward_flags["last_test_pass_ratio"] = pass_ratio
 
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
@@ -171,17 +204,28 @@ class GitReviewEnvironment(Environment):
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
             feedback=f"Tests: {passed}/{total} passed.",
-            metadata={"tests_run": True, "passed": passed, "total": total},
+            metadata={
+                "tests_run": True,
+                "passed": passed,
+                "total": total,
+                "pass_ratio": round(pass_ratio, 4),
+            },
         )
 
     def _handle_post_comment(self, action: ReviewAction) -> ReviewObservation:
         if not action.comment:
+            self._apply_reward_delta(-0.1)
             return self._make_error_obs("comment is required for POST_COMMENT")
         
         entry = f"[{action.file_path or 'Global'} L{action.line_number or '?'}] {action.comment}"
         self._state.comment_threads.append(entry)
-        
-        self._state.total_reward += 0.05  # small reward for interacting
+
+        # Strong but controlled signal: reward first meaningful comment more.
+        if not self._reward_flags["comment_rewarded"]:
+            self._apply_reward_delta(0.05)
+            self._reward_flags["comment_rewarded"] = True
+        else:
+            self._apply_reward_delta(0.01)
         
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
@@ -200,13 +244,50 @@ class GitReviewEnvironment(Environment):
 
     def _handle_submit_patch(self, action: ReviewAction) -> ReviewObservation:
         if not action.file_path or action.resolved_content is None:
+            self._apply_reward_delta(-0.1)
             return self._make_error_obs("file_path and resolved_content required for SUBMIT_PATCH")
         
         if action.file_path not in self._state.current_files:
+            self._apply_reward_delta(-0.1)
             return self._make_error_obs(f"file '{action.file_path}' not found.")
 
+        previous_content = self._state.current_files[action.file_path]
+        new_content = action.resolved_content
+        target_content = self._state.ground_truth.get(action.file_path)
+
+        patch_feedback = []
+
+        if new_content == previous_content:
+            self._apply_reward_delta(-0.1)
+            patch_feedback.append("No-op patch detected.")
+
+        # Penalize syntactically invalid Python for this task domain.
+        try:
+            compile(new_content, action.file_path, "exec")
+            syntax_ok = True
+        except SyntaxError:
+            syntax_ok = False
+            self._apply_reward_delta(-0.2)
+            patch_feedback.append("Patch has syntax errors.")
+
         self._state.current_files[action.file_path] = action.resolved_content
-        self._state.total_reward -= 0.01
+
+        if target_content is not None:
+            if new_content == target_content:
+                self._apply_reward_delta(0.3)
+                patch_feedback.append("Correct patch applied (+0.3).")
+            else:
+                # Partial progress signal based on structure similarity.
+                similarity = ast_similarity(new_content, target_content)
+                partial_reward = 0.15 * similarity
+                self._apply_reward_delta(partial_reward)
+                self._apply_reward_delta(-0.1)
+                patch_feedback.append(
+                    f"Patch not fully correct (similarity={similarity:.2f})."
+                )
+        elif syntax_ok:
+            self._apply_reward_delta(0.05)
+            patch_feedback.append("Valid patch submitted.")
 
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
@@ -220,7 +301,10 @@ class GitReviewEnvironment(Environment):
             task_description=self._task_data.get("description", ""),
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
-            feedback=f"Patch applied to '{action.file_path}'.",
+            feedback=(
+                f"Patch applied to '{action.file_path}'. "
+                + (" ".join(patch_feedback) if patch_feedback else "")
+            ).strip(),
         )
 
     def _handle_approve(self) -> ReviewObservation:
@@ -290,4 +374,10 @@ class GitReviewEnvironment(Environment):
             max_steps=self._state.max_steps,
             feedback=feedback,
             metadata={"already_done": True},
+        )
+
+    def _apply_reward_delta(self, delta: float) -> None:
+        # Keep intermediate rewards bounded and comparable across trajectories.
+        self._state.total_reward = round(
+            max(0.0, min(1.0, self._state.total_reward + float(delta))), 4
         )
