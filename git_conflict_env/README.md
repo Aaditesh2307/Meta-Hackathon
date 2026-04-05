@@ -255,3 +255,14 @@ All episodes use pre-generated, seeded data stored as JSON. Same seed + same tas
 ## 📜 License
 
 MIT License
+
+
+# Build Using
+
+docker build -t git_conflict_env .
+
+
+
+# Run Using
+
+docker run --rm -p 8000:8000 git_conflict_env
