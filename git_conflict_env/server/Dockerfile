@@ -9,10 +9,11 @@ WORKDIR /app
 # Build argument to control standalone vs in-repo mode 
 ARG BUILD_MODE=standalone
 
-# Copy environment code
-COPY . /app/env
-
 WORKDIR /app/env
+
+# Copy dependency manifests first to maximize layer cache hits.
+COPY pyproject.toml /app/env/
+COPY uv.lock /app/env/
 
 # Ensure uv is available
 RUN if ! command -v uv >/dev/null 2>&1; then \
@@ -21,18 +22,16 @@ RUN if ! command -v uv >/dev/null 2>&1; then \
         mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
 
-# Install git (build-time only)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install dependencies
+# Install dependencies (without installing local project yet)
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
         uv sync --frozen --no-install-project --no-editable; \
     else \
         uv sync --no-install-project --no-editable; \
     fi
+
+# Copy environment code after dependency layer is prepared.
+COPY . /app/env
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \

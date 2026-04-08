@@ -1,0 +1,11 @@
+# Exclude local environments and transient artifacts from HF upload
+venv/
+.venv/
+.venv_windows_backup/
+venv_py314_backup/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.DS_Store
+random/

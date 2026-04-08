@@ -1,3 +1,13 @@
+---
+title: Meta-Hackathon
+emoji: "🤖"
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8000
+pinned: false
+---
+
 # GitConflictEnv — AI Environment for Git Merge Conflict Resolution
 
 [![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-brightgreen)](https://github.com/meta-pytorch/OpenEnv)

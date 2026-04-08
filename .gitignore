@@ -1,0 +1,10 @@
+
+# Local archive folders
+moved_from_git_conflict_env_*/
+
+# Local secrets
+git_conflict_env/.env
+
+# Python cache
+**/__pycache__/
+*.pyc

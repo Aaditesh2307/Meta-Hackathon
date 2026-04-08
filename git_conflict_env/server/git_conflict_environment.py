@@ -6,6 +6,7 @@ PRs, find logic bugs, and apply fixes.
 """
 
 import copy
+import difflib
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -131,7 +132,6 @@ class GitReviewEnvironment(Environment):
             )
 
         self._state.step_count += 1
-        prev_files = copy.deepcopy(self._state.current_files)
 
         # Balanced efficiency pressure: keep this small so progress remains visible.
         self._apply_reward_delta(-0.01)
@@ -171,11 +171,12 @@ class GitReviewEnvironment(Environment):
 
     def _handle_run_tests(self) -> ReviewObservation:
         test_results = run_test_suite(
-            self._state.current_files, self._state.test_suite
+            self._state.current_files, self._state.test_suite, detect_cheating=True
         )
         passed = sum(1 for v in test_results.values() if v)
         total = len(test_results)
         pass_ratio = (passed / total) if total > 0 else 0.0
+        failed_tests = [name for name, ok in test_results.items() if not ok]
 
         # Reward only *improvement* in test pass ratio to avoid reward farming.
         previous_ratio = float(self._reward_flags.get("last_test_pass_ratio", 0.0))
@@ -183,10 +184,10 @@ class GitReviewEnvironment(Environment):
         if improvement > 0:
             self._apply_reward_delta(0.4 * improvement)
         elif improvement < 0:
-            self._apply_reward_delta(-0.1 * abs(improvement))
+            self._apply_reward_delta(-0.15 * abs(improvement))  # Harder penalty for regression
 
         if total > 0 and passed == 0:
-            self._apply_reward_delta(-0.1)
+            self._apply_reward_delta(-0.15)  # Harder penalty for complete failure
 
         self._reward_flags["last_test_pass_ratio"] = pass_ratio
 
@@ -209,6 +210,8 @@ class GitReviewEnvironment(Environment):
                 "passed": passed,
                 "total": total,
                 "pass_ratio": round(pass_ratio, 4),
+                "failed_tests": failed_tests,
+                "error_message": None,
             },
         )
 
@@ -244,11 +247,11 @@ class GitReviewEnvironment(Environment):
 
     def _handle_submit_patch(self, action: ReviewAction) -> ReviewObservation:
         if not action.file_path or action.resolved_content is None:
-            self._apply_reward_delta(-0.1)
+            self._apply_reward_delta(-0.15)
             return self._make_error_obs("file_path and resolved_content required for SUBMIT_PATCH")
         
         if action.file_path not in self._state.current_files:
-            self._apply_reward_delta(-0.1)
+            self._apply_reward_delta(-0.15)
             return self._make_error_obs(f"file '{action.file_path}' not found.")
 
         previous_content = self._state.current_files[action.file_path]
@@ -256,38 +259,56 @@ class GitReviewEnvironment(Environment):
         target_content = self._state.ground_truth.get(action.file_path)
 
         patch_feedback = []
+        error_message = None
 
         if new_content == previous_content:
-            self._apply_reward_delta(-0.1)
+            self._apply_reward_delta(-0.15)
             patch_feedback.append("No-op patch detected.")
 
-        # Penalize syntactically invalid Python for this task domain.
-        try:
-            compile(new_content, action.file_path, "exec")
-            syntax_ok = True
-        except SyntaxError:
-            syntax_ok = False
-            self._apply_reward_delta(-0.2)
-            patch_feedback.append("Patch has syntax errors.")
+        # Check for cheating patterns in the patch
+        from graders import _detect_cheating_patterns
+        cheating_violations = _detect_cheating_patterns(new_content)
+        if cheating_violations:
+            self._apply_reward_delta(-0.5)  # HEAVY penalty for cheating
+            patch_feedback.append(f"Cheating detected: {cheating_violations[0]}")
+            error_message = "cheating_detected"
+            self._state.current_files[action.file_path] = action.resolved_content
+        else:
+            # Penalize syntactically invalid Python for this task domain.
+            try:
+                compile(new_content, action.file_path, "exec")
+                syntax_ok = True
+            except SyntaxError:
+                syntax_ok = False
+                self._apply_reward_delta(-0.25)
+                patch_feedback.append("Patch has syntax errors.")
+                error_message = "syntax_error"
 
-        self._state.current_files[action.file_path] = action.resolved_content
+            self._state.current_files[action.file_path] = action.resolved_content
 
-        if target_content is not None:
-            if new_content == target_content:
-                self._apply_reward_delta(0.3)
-                patch_feedback.append("Correct patch applied (+0.3).")
-            else:
-                # Partial progress signal based on structure similarity.
-                similarity = ast_similarity(new_content, target_content)
-                partial_reward = 0.15 * similarity
-                self._apply_reward_delta(partial_reward)
-                self._apply_reward_delta(-0.1)
-                patch_feedback.append(
-                    f"Patch not fully correct (similarity={similarity:.2f})."
-                )
-        elif syntax_ok:
-            self._apply_reward_delta(0.05)
-            patch_feedback.append("Valid patch submitted.")
+            if target_content is not None:
+                if new_content == target_content:
+                    self._apply_reward_delta(0.3)
+                    patch_feedback.append("Correct patch applied (+0.3).")
+                else:
+                    # Do not reward wrong patches; keep signal strict.
+                    similarity = ast_similarity(new_content, target_content)
+                    self._apply_reward_delta(-0.2)  # Harder penalty for wrong patch
+                    patch_feedback.append("Patch applied but logic incorrect. Tests failing.")
+                    error_message = "incorrect_patch"
+            elif syntax_ok:
+                self._apply_reward_delta(0.05)
+                patch_feedback.append("Valid patch submitted.")
+
+        diff_preview = "\n".join(
+            difflib.unified_diff(
+                previous_content.splitlines(),
+                new_content.splitlines(),
+                fromfile=f"a/{action.file_path}",
+                tofile=f"b/{action.file_path}",
+                lineterm="",
+            )
+        )
 
         if self._state.step_count >= self._state.max_steps:
             return self._handle_step_limit()
@@ -305,11 +326,40 @@ class GitReviewEnvironment(Environment):
                 f"Patch applied to '{action.file_path}'. "
                 + (" ".join(patch_feedback) if patch_feedback else "")
             ).strip(),
+            metadata={
+                "file_path": action.file_path,
+                "error_message": error_message,
+                "diff": diff_preview[:2000],
+            },
         )
 
     def _handle_approve(self) -> ReviewObservation:
+        # Reject premature approval so agents can continue learning over trajectory.
+        # Approval is only terminal after tests are fully passing.
+        pass_ratio = float(self._reward_flags.get("last_test_pass_ratio", 0.0))
+        if pass_ratio < 1.0:
+            self._apply_reward_delta(-0.05)
+            if self._state.step_count >= self._state.max_steps:
+                return self._handle_step_limit()
+
+            return ReviewObservation(
+                done=False,
+                reward=self._state.total_reward,
+                current_files=copy.deepcopy(self._state.current_files),
+                pr_diff=self._state.pr_diff,
+                comment_threads=copy.deepcopy(self._state.comment_threads),
+                task_description=self._task_data.get("description", ""),
+                current_step=self._state.step_count,
+                max_steps=self._state.max_steps,
+                feedback="Cannot approve before passing tests.",
+                metadata={
+                    "error": "premature_approve",
+                    "pass_ratio": round(pass_ratio, 4),
+                },
+            )
+
         self._state.is_done = True
-        
+
         final_score, grader_info = grade(
             self._state.task_id,
             self._state.current_files,
@@ -317,7 +367,9 @@ class GitReviewEnvironment(Environment):
             self._state.test_suite,
             self._state.comment_threads
         )
-        
+
+        # Clamp final score to valid [0, 1] range
+        final_score = max(0.0, min(1.0, final_score))
         self._state.total_reward = final_score
 
         return ReviewObservation(
@@ -359,7 +411,10 @@ class GitReviewEnvironment(Environment):
             current_step=self._state.step_count,
             max_steps=self._state.max_steps,
             feedback=f"Error: {msg}",
-            metadata={"error": "invalid_action_params"},
+            metadata={
+                "error": "invalid_action_params",
+                "error_message": msg,
+            },
         )
 
     def _make_done_observation(self, feedback: str) -> ReviewObservation:
@@ -377,7 +432,8 @@ class GitReviewEnvironment(Environment):
         )
 
     def _apply_reward_delta(self, delta: float) -> None:
-        # Keep intermediate rewards bounded and comparable across trajectories.
-        self._state.total_reward = round(
-            max(0.0, min(1.0, self._state.total_reward + float(delta))), 4
-        )
+        # Allow negative intermediate rewards for better RL signal.
+        # Final score gets clamped to [0, 1] when episode ends.
+        updated_reward = round(self._state.total_reward + float(delta), 4)
+        # Cosmetic consistency: do not show rewards above 1.0 mid-episode.
+        self._state.total_reward = min(updated_reward, 1.0)

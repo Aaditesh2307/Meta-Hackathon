@@ -109,7 +109,7 @@ def run_baseline(
     )
     results = {}
 
-    for task_id in ["easy"]:  # Reduced to only easy for now since others aren't ready
+    for task_id in ["easy", "medium", "hard"]:
         if verbose:
             print(f"\n{'='*60}")
             print(f"Task: {task_id} (seed={seed})")
