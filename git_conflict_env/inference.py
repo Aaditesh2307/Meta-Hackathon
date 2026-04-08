@@ -63,6 +63,7 @@ MAX_STEPS = REQUESTED_MAX_STEPS if ALLOW_SHORT_EPISODES else max(REQUESTED_MAX_S
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1200"))
 SUCCESS_SCORE_THRESHOLD = float(os.getenv("SUCCESS_SCORE_THRESHOLD", "0.7"))
+SCORE_EPSILON = float(os.getenv("SCORE_EPSILON", "0.01"))
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -116,6 +117,12 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}", flush=True)
+
+
+def _normalize_final_score(score: float) -> float:
+    """Keep the reported task score strictly inside the open interval (0, 1)."""
+    score = min(max(score, SCORE_EPSILON), 1.0 - SCORE_EPSILON)
+    return round(score, 2)
 
 
 def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -481,8 +488,7 @@ def run_episode_with_attempts(client: Any, task: str) -> None:
                     break
 
             # Environment uses normalized reward in [0,1] as final score on completion.
-            score = float(obs.get("reward") or 0.0)
-            score = min(max(score, 0.0), 1.0)
+            score = _normalize_final_score(float(obs.get("reward") or 0.0))
             success = score >= SUCCESS_SCORE_THRESHOLD
 
         finally:
@@ -563,8 +569,7 @@ def run_episode(client: Any, task: str) -> None:
                 break
 
         # Environment uses normalized reward in [0,1] as final score on completion.
-        score = float(obs.get("reward") or 0.0)
-        score = min(max(score, 0.0), 1.0)
+        score = _normalize_final_score(float(obs.get("reward") or 0.0))
         success = score >= SUCCESS_SCORE_THRESHOLD
 
     finally:
